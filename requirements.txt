@@ -1,0 +1,4 @@
+langchain-ollama>=1.0.0
+langchain-openai>=1.0.3
+langchain-anthropic>=1.0.4
+langchain-google-genai>=3.0.3
