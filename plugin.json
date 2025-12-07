@@ -1,6 +1,6 @@
 {
     "name": "Language Models Pack",
-    "version": "0.0.3",
+    "version": "0.0.4",
     "description": "Adapters for most used LLM vendors: OpenAI, Anthropic, Gemini, Ollama",
     "author_name": "Cheshire Cat AI",
     "author_url": "https://cheshirecat.ai",
