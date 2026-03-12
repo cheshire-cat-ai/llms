@@ -1,63 +1,48 @@
 from typing import List
 from pydantic import BaseModel, Field
-from langchain_ollama import ChatOllama, OllamaEmbeddings
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.embeddings import Embeddings
 
-from cat.base import ModelProvider
+from cat import log
+from ..adapters import OpenAICompatibleProvider
 
-class Ollama(ModelProvider):
+
+class Ollama(OpenAICompatibleProvider):
     """Ollama models."""
 
+    slug = "ollama"
+    description = "Locally running Ollama models."
+
+    class Settings(BaseModel):
+        host: str = Field(
+            default="http://localhost:11434",
+            title="Ollama Host",
+            description="The host URL for the Ollama API.",
+        )
+        key: str = Field(
+            default="ollama",
+            title="Ollama API Key",
+            description="The API key for authenticating with the Ollama API.",
+        )
+
     async def setup(self):
-        """Load configuration from settings."""
-        settings = await self.plugin.load_settings()
-        self.host = settings.get("host", None)
-        self.key = settings.get("key", None)
+        from openai import AsyncOpenAI
 
-    def list_llms(self) -> List[str]:
-        """Return list of available LLM slugs."""
-        # TODOV2: pull dynamically from Ollama API
-        return [
-            "gpt-oss"
-        ]
+        settings = await self.load_settings()
+        host = settings.host
+        key = settings.key
 
-    def list_embedders(self) -> List[str]:
-        """Return list of available embedder slugs."""
-        # TODOV2: pull dynamically from Ollama API
-        return [
-            "embeddinggemma:300m"
-        ]
-
-    async def get_llm(self, slug: str) -> BaseChatModel:
-        """Create and return Ollama LLM instance."""
-        return ChatOllama(
-            base_url=self.host,
-            model=slug,
-            api_key=self.key,
-            temperature=0.1,
+        self.client = AsyncOpenAI(
+            base_url=f"{host.rstrip('/')}/v1",
+            api_key=key or "ollama",
         )
+        await self._refresh_model_lists()
 
-    async def get_embedder(self, slug: str) -> Embeddings:
-        """Create and return Ollama embedder instance."""
-        return OllamaEmbeddings(
-            base_url=self.host,
-            model=slug,
-        )
-    
-    async def settings_model(self):
-        """Return settings model."""
-
-        class OllamaSettings(BaseModel):
-            host: str = Field(
-                default="",
-                title="Ollama Host",
-                description="The host URL for the Ollama API.",
-            )
-            key: str = Field(
-                default="",
-                title="Ollama API Key",
-                description="The API key for authenticating with the Ollama API.",
-            )
-
-        return OllamaSettings
+    async def _refresh_model_lists(self):
+        try:
+            models = await self.client.models.list()
+            all_ids: List[str] = [m.id for m in models.data]
+            self._llms_cache = [m for m in all_ids if "embed" not in m]
+            self._embedders_cache = [m for m in all_ids if "embed" in m]
+        except Exception as e:
+            log.error(f"Ollama: failed to fetch model list: {e}")
+            self._llms_cache = []
+            self._embedders_cache = []
