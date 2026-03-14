@@ -3,7 +3,7 @@ from pydantic import BaseModel, Field
 
 from cat import log
 from cat.services.model_providers.base import ModelProvider
-from cat.protocols.model_context.type_wrappers import TextContent, ImageContent
+from cat.protocols.model_context.type_wrappers import TextContent, ImageContent, ToolCall
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -29,21 +29,17 @@ class Anthropic(ModelProvider):
 
         settings = await self.load_settings()
         api_key = settings.anthropic_key
-        if not api_key:
-            self.client = None
-            self._llms_cache: List[str] = []
-            return
-
-        self.client = AsyncAnthropic(api_key=api_key)
-        try:
-            models = await self.client.models.list()
-            self._llms_cache = [m.id for m in models.data]
-        except Exception as e:
-            log.error(f"Anthropic: failed to fetch model list: {e}")
-            self._llms_cache = []
+        self.client = AsyncAnthropic(api_key=api_key) if api_key else None
 
     async def list_llms(self) -> List[str]:
-        return getattr(self, "_llms_cache", [])
+        if not getattr(self, "client", None):
+            return []
+        try:
+            models = await self.client.models.list()
+            return [m.id for m in models.data]
+        except Exception as e:
+            log.error(f"Anthropic: failed to fetch model list: {e}")
+            return []
 
     async def list_embedders(self) -> List[str]:
         return []
@@ -68,9 +64,9 @@ class Anthropic(ModelProvider):
                 for tc in msg.tool_calls:
                     content.append({
                         "type": "tool_use",
-                        "id": tc["id"],
-                        "name": tc["name"],
-                        "input": tc["args"],
+                        "id": tc.id,
+                        "name": tc.name,
+                        "input": tc.args,
                     })
                 result.append({"role": "assistant", "content": content})
             else:
@@ -112,15 +108,16 @@ class Anthropic(ModelProvider):
             if block.type == "text":
                 text += block.text
             elif block.type == "tool_use":
-                tool_calls.append({
-                    "id": block.id,
-                    "name": block.name,
-                    "args": block.input,
-                })
+                tool_calls.append(ToolCall(
+                    id=block.id,
+                    name=block.name,
+                    args=block.input,
+                ))
 
+        content = [TextContent(type="text", text=text)] if text else []
         return Message(
             role="assistant",
-            content=[TextContent(type="text", text=text)],
+            content=content,
             tool_calls=tool_calls,
         )
 
@@ -131,6 +128,7 @@ class Anthropic(ModelProvider):
         system_prompt: str = "",
         tools: list["Tool"] = [],
         on_token: "Callable[[str], Awaitable[None]] | None" = None,
+        on_tool_call: "Callable[[ToolCall], Awaitable[None]] | None" = None,
     ) -> "Message":
         from cat.types import Message
 
@@ -157,16 +155,27 @@ class Anthropic(ModelProvider):
                 final = await stream.get_final_message()
 
             tool_calls = [
-                {"id": block.id, "name": block.name, "args": block.input}
+                ToolCall(id=block.id, name=block.name, args=block.input)
                 for block in final.content
                 if block.type == "tool_use"
             ]
 
+            if on_tool_call:
+                for tc in tool_calls:
+                    await on_tool_call(tc)
+
+            content = [TextContent(type="text", text=full_text)] if full_text else []
             return Message(
                 role="assistant",
-                content=[TextContent(type="text", text=full_text)],
+                content=content,
                 tool_calls=tool_calls,
             )
 
         response = await self.client.messages.create(**kwargs)
-        return self._parse_response(response)
+        result = self._parse_response(response)
+
+        if on_tool_call:
+            for tc in result.tool_calls:
+                await on_tool_call(tc)
+
+        return result

@@ -2,7 +2,8 @@ import json
 from typing import List, TYPE_CHECKING
 
 from cat.services.model_providers.base import ModelProvider
-from cat.protocols.model_context.type_wrappers import TextContent, ImageContent
+from cat.protocols.model_context.type_wrappers import TextContent, ImageContent, ToolCall
+from cat import log
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -24,11 +25,32 @@ class OpenAICompatibleProvider(ModelProvider):
 
     service_type = "model_providers"
 
+    async def _fetch_models(self) -> List[str]:
+        """Fetch all model IDs from the vendor API. Returns [] on failure."""
+        if not getattr(self, "client", None):
+            return []
+        try:
+            models = await self.client.models.list()
+            return [m.id for m in models.data]
+        except Exception as e:
+            log.error(f"{self.slug}: failed to fetch model list: {e}")
+            return []
+
+    def _is_embedder(self, model_id: str) -> bool:
+        """Return True if model_id is an embedder. Override for custom filtering."""
+        return "embed" in model_id
+
+    def _is_llm(self, model_id: str) -> bool:
+        """Return True if model_id is a chat/LLM model. Override for custom filtering."""
+        return not self._is_embedder(model_id)
+
     async def list_llms(self) -> List[str]:
-        return getattr(self, "_llms_cache", [])
+        all_models = await self._fetch_models()
+        return [m for m in all_models if self._is_llm(m)]
 
     async def list_embedders(self) -> List[str]:
-        return getattr(self, "_embedders_cache", [])
+        all_models = await self._fetch_models()
+        return [m for m in all_models if self._is_embedder(m)]
 
     async def build_messages(self, messages: list["Message"], system_prompt: str) -> list[dict]:
         """Convert Cat messages to OpenAI message format."""
@@ -54,11 +76,11 @@ class OpenAICompatibleProvider(ModelProvider):
                 "content": msg.text or "",
                 "tool_calls": [
                     {
-                        "id": tc["id"],
+                        "id": tc.id,
                         "type": "function",
                         "function": {
-                            "name": tc["name"],
-                            "arguments": json.dumps(tc["args"]),
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.args),
                         },
                     }
                     for tc in msg.tool_calls
@@ -107,15 +129,16 @@ class OpenAICompatibleProvider(ModelProvider):
 
         if oai_msg.tool_calls:
             for tc in oai_msg.tool_calls:
-                tool_calls.append({
-                    "id": tc.id,
-                    "name": tc.function.name,
-                    "args": json.loads(tc.function.arguments),
-                })
+                tool_calls.append(ToolCall(
+                    id=tc.id,
+                    name=tc.function.name,
+                    args=json.loads(tc.function.arguments),
+                ))
 
+        content = [TextContent(type="text", text=text)] if text else []
         return Message(
             role="assistant",
-            content=[TextContent(type="text", text=text)],
+            content=content,
             tool_calls=tool_calls,
         )
 
@@ -125,6 +148,7 @@ class OpenAICompatibleProvider(ModelProvider):
         messages: list[dict],
         tools: list[dict],
         on_token: "Callable[[str], Awaitable[None]]",
+        on_tool_call: "Callable[[ToolCall], Awaitable[None]] | None" = None,
     ) -> "Message":
         """Stream completion and return complete Message."""
         from cat.types import Message
@@ -158,13 +182,18 @@ class OpenAICompatibleProvider(ModelProvider):
                             tool_calls_acc[idx]["args_str"] += tc_delta.function.arguments
 
         tool_calls = [
-            {"id": tc["id"], "name": tc["name"], "args": json.loads(tc["args_str"] or "{}")}
+            ToolCall(id=tc["id"], name=tc["name"], args=json.loads(tc["args_str"] or "{}"))
             for tc in tool_calls_acc.values()
         ]
 
+        if on_tool_call:
+            for tc in tool_calls:
+                await on_tool_call(tc)
+
+        content = [TextContent(type="text", text=full_text)] if full_text else []
         return Message(
             role="assistant",
-            content=[TextContent(type="text", text=full_text)],
+            content=content,
             tool_calls=tool_calls,
         )
 
@@ -175,19 +204,26 @@ class OpenAICompatibleProvider(ModelProvider):
         system_prompt: str = "",
         tools: list["Tool"] = [],
         on_token: "Callable[[str], Awaitable[None]] | None" = None,
+        on_tool_call: "Callable[[ToolCall], Awaitable[None]] | None" = None,
     ) -> "Message":
         oai_messages = await self.build_messages(messages, system_prompt)
         oai_tools = self.build_tools(tools) if tools else []
 
         if on_token:
-            return await self.stream_completion(model, oai_messages, oai_tools, on_token)
+            return await self.stream_completion(model, oai_messages, oai_tools, on_token, on_tool_call)
 
         kwargs = {"model": model, "messages": oai_messages}
         if oai_tools:
             kwargs["tools"] = oai_tools
 
         response = await self.client.chat.completions.create(**kwargs)
-        return self.parse_response(response)
+        result = self.parse_response(response)
+
+        if on_tool_call:
+            for tc in result.tool_calls:
+                await on_tool_call(tc)
+
+        return result
 
     async def embed(self, model: str, text: str) -> list[float]:
         """Embed text using OpenAI embeddings API."""
